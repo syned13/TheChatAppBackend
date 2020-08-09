@@ -30,6 +30,8 @@ const (
 	MessageTypeMessage MessageType = "message"
 	// MessageTypeRegistration registration
 	MessageTypeRegistration MessageType = "registration"
+	// MessageTypeError error
+	MessageTypeError MessageType = "error"
 )
 
 // Message message
@@ -43,7 +45,7 @@ type Message struct {
 // User represents an user using the thing
 type User struct {
 	Nickname string `json:"nickname"`
-	ID       string `id`
+	ID       string `json:"id"`
 	// Something else, what comes
 }
 
@@ -103,11 +105,10 @@ func hello(w http.ResponseWriter, r *http.Request) {
 
 func handleWs(upgrader websocket.Upgrader) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		log.Println("new client!")
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			// TODO: handle err
-			log.Fatal(err)
+			log.Println("upgrading_connection_failed: " + err.Error())
+			return
 		}
 
 		defer ws.Close()
@@ -116,19 +117,7 @@ func handleWs(upgrader websocket.Upgrader) http.HandlerFunc {
 		clients[guid.String()] = ws
 		onlineUsers[guid.String()] = &User{Nickname: "", ID: guid.String()}
 
-		log.Println("new client")
-
-		message := Message{
-			FromID:      ServerRoomID,
-			ToID:        guid.String(),
-			MessageType: MessageTypeRegistration,
-		}
-
-		err = ws.WriteJSON(message)
-		if err != nil {
-			// TODO: handle error
-			log.Fatal("failed to send registration message to client")
-		}
+		log.Println("new client: " + guid.String())
 
 		ws.SetCloseHandler(clientCloseHandler)
 
@@ -138,19 +127,73 @@ func handleWs(upgrader websocket.Upgrader) http.HandlerFunc {
 			if websocket.IsUnexpectedCloseError(err) {
 				delete(clients, guid.String())
 				delete(onlineUsers, guid.String())
+
+				return
 			}
 
 			if err != nil {
-				log.Println("unmarshalling_message_failed" + err.Error())
-				// TODO: give feedback to the user when an error happens
-				delete(clients, guid.String())
+				log.Println("unmarshalling_message_failed: " + err.Error())
+				err = sendErrorMessage(guid.String(), "invalid_message_format")
+				if err != nil {
+					delete(clients, guid.String())
+					delete(onlineUsers, guid.String())
+
+					ws.Close()
+				}
+
+				return
 			}
 
-			fmt.Println(msg.Body)
-			log.Println("received_message")
 			broadcast <- msg
 		}
 	}
+}
+
+func clientExists(id string) bool {
+	_, ok := clients[id]
+
+	return ok
+}
+
+func sendRegistrationMessage(id string) error {
+	message := Message{
+		FromID:      ServerRoomID,
+		ToID:        id,
+		MessageType: MessageTypeRegistration,
+		Body:        id,
+	}
+
+	if !clientExists(id) {
+		return ErrInvalidToID
+	}
+
+	err := clients[id].WriteJSON(message)
+	if err != nil {
+		log.Print("sending_registration_message_to_client_failed: " + err.Error())
+		err = clients[id].Close()
+		if err != nil {
+			log.Println("closing_connection_failed: " + err.Error())
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func sendErrorMessage(id string, errorMessage string) error {
+	msg := Message{
+		FromID:      ServerRoomID,
+		ToID:        id,
+		MessageType: MessageTypeError,
+		Body:        errorMessage,
+	}
+
+	if _, ok := clients[id]; !ok {
+		return ErrInvalidToID
+	}
+
+	return clients[id].WriteJSON(msg)
 }
 
 func clientCloseHandler(code int, text string) error {
