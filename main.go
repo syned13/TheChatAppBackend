@@ -32,6 +32,11 @@ const (
 	MessageTypeRegistration MessageType = "registration"
 	// MessageTypeError error
 	MessageTypeError MessageType = "error"
+
+	// MainRoomID is the ID of the main room where everyone is
+	MainRoomID string = "mainRoom"
+	// ServerRoomID is the ToID to messages directed to the server
+	ServerRoomID string = "server"
 )
 
 // Message message
@@ -49,20 +54,26 @@ type User struct {
 	// Something else, what comes
 }
 
+// BroadcastBody is the struct sent to the broadcast channel
+type BroadcastBody struct {
+	msg Message
+	ws  *websocket.Conn
+}
+
 var (
 	// ErrInvalidToID invalid to id
 	ErrInvalidToID = errors.New("invalid to id")
+	// ErrMissingFromID missing from id
+	ErrMissingFromID = errors.New("missing from id")
+	// ErrMissingBody missing body
+	ErrMissingBody = errors.New("missing body")
 )
 
-// MainRoomID is the ID of the main room where everyone is
-const MainRoomID string = "mainRoom"
-
-// ServerRoomID is the ToID to messages directed to the server
-const ServerRoomID string = "server"
-
-var clients = map[string]*websocket.Conn{}
-var onlineUsers = map[string]*User{} // This maps the ID's with the user structs
-var broadcast = make(chan Message)
+var (
+	clients     = map[string]*websocket.Conn{}
+	onlineUsers = map[string]*User{} // This maps the ID's with the user structs
+	broadcast   = make(chan BroadcastBody)
+)
 
 func main() {
 	router := mux.NewRouter()
@@ -79,7 +90,6 @@ func main() {
 
 	log.Println("Listening...")
 	log.Fatal(http.ListenAndServe(":5000", loggedRouter))
-
 }
 
 func getAllUserS(w http.ResponseWriter, r *http.Request) {
@@ -113,39 +123,52 @@ func handleWs(upgrader websocket.Upgrader) http.HandlerFunc {
 
 		defer ws.Close()
 
+		// Registers the new client
 		guid := xid.New()
 		clients[guid.String()] = ws
 		onlineUsers[guid.String()] = &User{Nickname: "", ID: guid.String()}
 
-		log.Println("new client: " + guid.String())
-
 		ws.SetCloseHandler(clientCloseHandler)
 
-		for {
-			var msg Message
-			err = ws.ReadJSON(&msg)
-			if websocket.IsUnexpectedCloseError(err) {
-				delete(clients, guid.String())
-				delete(onlineUsers, guid.String())
+		log.Println("new client: " + guid.String())
 
-				return
-			}
+		err = sendRegistrationMessage(guid.String())
+		if err != nil {
+			log.Println("sending_registration_message_to_client_failed: " + err.Error())
 
-			if err != nil {
-				log.Println("unmarshalling_message_failed: " + err.Error())
-				err = sendErrorMessage(guid.String(), "invalid_message_format")
-				if err != nil {
-					delete(clients, guid.String())
-					delete(onlineUsers, guid.String())
-
-					ws.Close()
-				}
-
-				return
-			}
-
-			broadcast <- msg
+			delete(clients, guid.String())
+			delete(onlineUsers, guid.String())
+			ws.Close()
 		}
+
+		listenForMessages(ws, guid.String())
+	}
+}
+
+func listenForMessages(ws *websocket.Conn, id string) {
+	for {
+		var msg Message
+		err := ws.ReadJSON(&msg)
+		if websocket.IsUnexpectedCloseError(err) {
+			delete(clients, id)
+			delete(onlineUsers, id)
+
+			return
+		}
+
+		if err != nil {
+			log.Println("unmarshalling_message_failed: " + err.Error())
+			err = sendErrorMessage(id, "invalid_message_format")
+			if err != nil {
+				delete(clients, id)
+				delete(onlineUsers, id)
+				ws.Close()
+			}
+
+			return
+		}
+
+		broadcast <- BroadcastBody{msg: msg, ws: ws}
 	}
 }
 
@@ -156,6 +179,10 @@ func clientExists(id string) bool {
 }
 
 func sendRegistrationMessage(id string) error {
+	if !clientExists(id) {
+		return ErrInvalidToID
+	}
+
 	message := Message{
 		FromID:      ServerRoomID,
 		ToID:        id,
@@ -163,13 +190,10 @@ func sendRegistrationMessage(id string) error {
 		Body:        id,
 	}
 
-	if !clientExists(id) {
-		return ErrInvalidToID
-	}
-
 	err := clients[id].WriteJSON(message)
 	if err != nil {
 		log.Print("sending_registration_message_to_client_failed: " + err.Error())
+
 		err = clients[id].Close()
 		if err != nil {
 			log.Println("closing_connection_failed: " + err.Error())
@@ -202,28 +226,90 @@ func clientCloseHandler(code int, text string) error {
 	return nil
 }
 
+func findClientID(ws *websocket.Conn) string {
+	for k, v := range clients {
+		if v == ws {
+			return k
+		}
+	}
+
+	return ""
+}
+
+func validateMessage(msg Message) error {
+	if msg.FromID == "" {
+		return ErrMissingFromID
+	}
+
+	if msg.ToID == "" {
+		return ErrMissingFromID
+	}
+
+	if _, ok := clients[msg.ToID]; !ok && msg.ToID != MainRoomID && msg.ToID != ServerRoomID {
+		return ErrInvalidToID
+	}
+
+	if msg.Body == "" {
+		return ErrMissingBody
+	}
+
+	return nil
+}
+
 func handleMessages() {
 	for {
-		msg := <-broadcast
-		if msg.ToID == ServerRoomID {
-			err := handleServerMessage(msg)
+		body := <-broadcast
+		err := validateMessage(body.msg)
+		if errors.Is(err, ErrMissingFromID) {
+			log.Println("missing_client_id_in_message")
+			id := findClientID(body.ws)
+			if id == "" {
+				log.Println("could_not_find_client_id")
+			}
+
+			if id != "" {
+				delete(clients, id)
+				delete(onlineUsers, id)
+			}
+
+			body.ws.Close()
+
+			continue
+		}
+
+		if err != nil {
+			log.Println("invalid_message_received: " + err.Error())
+			sendErrorMessage(body.msg.FromID, "invalid message")
+
+			continue
+		}
+
+		if body.msg.ToID == ServerRoomID {
+			err := handleServerMessage(body.msg)
 			if err != nil {
-				log.Println("failed")
+				log.Println("handling_server_message_failed")
+				sendErrorMessage(body.msg.FromID, "error")
+
+				continue
 			}
 		}
 
-		if msg.ToID == MainRoomID {
-			err := sendMessageToMainRoom(msg)
+		if body.msg.ToID == MainRoomID {
+			err := sendMessageToMainRoom(body.msg)
 			if err != nil {
 				// what ?
-				log.Println("failed")
+				log.Println("sending_message_to_main_room_failed: " + err.Error())
+				sendErrorMessage(body.msg.FromID, "error")
+				continue
 			}
 		}
 
-		if msg.MessageType == MessageTypeRequest {
-			err := sendMessageRequest(msg)
+		if body.msg.MessageType == MessageTypeRequest {
+			err := sendMessageRequest(body.msg)
 			if err != nil {
-				log.Println("failed")
+				log.Println("sending_request_message_failed: " + err.Error())
+				sendErrorMessage(body.msg.FromID, "error")
+				continue
 			}
 		}
 	}
@@ -252,6 +338,7 @@ func sendMessageToMainRoom(msg Message) error {
 func handleServerMessage(msg Message) error {
 	// TODO: check for missing attributes
 	if msg.MessageType == MessageTypeRegistration {
+
 		fmt.Println("Registration message: " + msg.Body)
 		onlineUsers[msg.FromID].Nickname = msg.Body
 	}
