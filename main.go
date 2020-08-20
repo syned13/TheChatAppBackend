@@ -146,7 +146,6 @@ func handleWs(upgrader websocket.Upgrader) http.HandlerFunc {
 			ws.Close()
 		}
 
-		sendNewUserMessage(guid.String())
 		listenForMessages(ws, guid.String())
 	}
 }
@@ -395,6 +394,7 @@ func handleServerMessage(msg Message) error {
 
 		fmt.Println("Registration message: " + msg.Body)
 		onlineUsers[msg.FromID].Nickname = msg.Body
+		sendNewUserMessage(msg.FromID)
 	}
 
 	return nil
