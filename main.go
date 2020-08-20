@@ -32,6 +32,10 @@ const (
 	MessageTypeRegistration MessageType = "registration"
 	// MessageTypeError error
 	MessageTypeError MessageType = "error"
+	// MessageTypeNewUser new user
+	MessageTypeNewUser MessageType = "newUser"
+	// MessageTypeGoneUser gone user
+	MessageTypeGoneUser MessageType = "goneUser"
 
 	// MainRoomID is the ID of the main room where everyone is
 	MainRoomID string = "mainRoom"
@@ -138,9 +142,11 @@ func handleWs(upgrader websocket.Upgrader) http.HandlerFunc {
 
 			delete(clients, guid.String())
 			delete(onlineUsers, guid.String())
+			sendGoneUserMessage(guid.String())
 			ws.Close()
 		}
 
+		sendNewUserMessage(guid.String())
 		listenForMessages(ws, guid.String())
 	}
 }
@@ -152,6 +158,7 @@ func listenForMessages(ws *websocket.Conn, id string) {
 		if websocket.IsUnexpectedCloseError(err) {
 			delete(clients, id)
 			delete(onlineUsers, id)
+			sendGoneUserMessage(id)
 
 			return
 		}
@@ -162,6 +169,7 @@ func listenForMessages(ws *websocket.Conn, id string) {
 			if err != nil {
 				delete(clients, id)
 				delete(onlineUsers, id)
+				sendGoneUserMessage(id)
 				ws.Close()
 			}
 
@@ -270,6 +278,7 @@ func handleMessages() {
 			if id != "" {
 				delete(clients, id)
 				delete(onlineUsers, id)
+				sendGoneUserMessage(id)
 			}
 
 			body.ws.Close()
@@ -279,6 +288,8 @@ func handleMessages() {
 
 		if err != nil {
 			log.Println("invalid_message_received: " + err.Error())
+			log.Println(body)
+
 			sendErrorMessage(body.msg.FromID, "invalid message")
 
 			continue
@@ -325,8 +336,51 @@ func sendMessageRequest(msg Message) error {
 }
 
 func sendMessageToMainRoom(msg Message) error {
+	msgToSend := Message{
+		FromID:      msg.FromID,
+		ToID:        MainRoomID,
+		MessageType: MessageTypeMessage,
+		Body:        msg.Body,
+	}
+
 	for _, ws := range clients {
-		err := ws.WriteJSON(ws)
+		err := ws.WriteJSON(msgToSend)
+		if err != nil {
+			log.Println("failed_to_send_message")
+		}
+	}
+
+	return nil
+}
+
+func sendNewUserMessage(id string) error {
+	msgToSend := Message{
+		FromID:      ServerRoomID,
+		MessageType: MessageTypeNewUser,
+		Body:        id,
+	}
+
+	for id, ws := range clients {
+		msgToSend.ToID = id
+		err := ws.WriteJSON(msgToSend)
+		if err != nil {
+			log.Println("failed_to_send_message")
+		}
+	}
+
+	return nil
+}
+
+func sendGoneUserMessage(id string) error {
+	msgToSend := Message{
+		FromID:      ServerRoomID,
+		MessageType: MessageTypeGoneUser,
+		Body:        id,
+	}
+
+	for id, ws := range clients {
+		msgToSend.ToID = id
+		err := ws.WriteJSON(msgToSend)
 		if err != nil {
 			log.Println("failed_to_send_message")
 		}
