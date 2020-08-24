@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/rs/xid"
+	"github.com/subosito/gotenv"
 )
 
 /*
@@ -74,11 +75,16 @@ var (
 )
 
 var (
+	port        string
 	clients     = map[string]*websocket.Conn{}
 	onlineUsers = map[string]*User{} // This maps the ID's with the user structs
 	broadcast   = make(chan BroadcastBody)
 )
 
+func init() {
+	gotenv.Load()
+	port = os.Getenv("PORT")
+}
 func main() {
 	router := mux.NewRouter()
 	upgrader := websocket.Upgrader{}
@@ -93,7 +99,7 @@ func main() {
 	go handleMessages()
 
 	log.Println("Listening...")
-	log.Fatal(http.ListenAndServe(":5000", loggedRouter))
+	log.Fatal(http.ListenAndServe(":"+port, loggedRouter))
 }
 
 func getAllUserS(w http.ResponseWriter, r *http.Request) {
